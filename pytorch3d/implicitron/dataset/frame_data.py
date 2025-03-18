@@ -26,7 +26,7 @@ from typing import (
 import numpy as np
 import torch
 
-from pytorch3d.implicitron.dataset import types
+from pytorch3d.implicitron.dataset import orm_types, types
 from pytorch3d.implicitron.dataset.utils import (
     adjust_camera_to_bbox_crop_,
     adjust_camera_to_image_scale_,
@@ -48,7 +48,11 @@ from pytorch3d.implicitron.dataset.utils import (
 from pytorch3d.implicitron.tools.config import registry, ReplaceableBase
 from pytorch3d.renderer.camera_utils import join_cameras_as_batch
 from pytorch3d.renderer.cameras import CamerasBase, PerspectiveCameras
+from pytorch3d.structures.meshes import join_meshes_as_batch, Meshes
 from pytorch3d.structures.pointclouds import join_pointclouds_as_batch, Pointclouds
+
+FrameAnnotationT = types.FrameAnnotation | orm_types.SqlFrameAnnotation
+SequenceAnnotationT = types.SequenceAnnotation | orm_types.SqlSequenceAnnotation
 
 
 @dataclass
@@ -122,9 +126,9 @@ class FrameData(Mapping[str, Any]):
         meta: A dict for storing additional frame information.
     """
 
-    frame_number: Optional[torch.LongTensor]
-    sequence_name: Union[str, List[str]]
-    sequence_category: Union[str, List[str]]
+    frame_number: Optional[torch.LongTensor] = None
+    sequence_name: Union[str, List[str]] = ""
+    sequence_category: Union[str, List[str]] = ""
     frame_timestamp: Optional[torch.Tensor] = None
     image_size_hw: Optional[torch.LongTensor] = None
     effective_image_size_hw: Optional[torch.LongTensor] = None
@@ -155,7 +159,7 @@ class FrameData(Mapping[str, Any]):
         new_params = {}
         for field_name in iter(self):
             value = getattr(self, field_name)
-            if isinstance(value, (torch.Tensor, Pointclouds, CamerasBase)):
+            if isinstance(value, (torch.Tensor, Pointclouds, CamerasBase, Meshes)):
                 new_params[field_name] = value.to(*args, **kwargs)
             else:
                 new_params[field_name] = value
@@ -417,7 +421,6 @@ class FrameData(Mapping[str, Any]):
             for f in fields(elem):
                 if not f.init:
                     continue
-
                 list_values = override_fields.get(
                     f.name, [getattr(d, f.name) for d in batch]
                 )
@@ -426,7 +429,7 @@ class FrameData(Mapping[str, Any]):
                     if all(list_value is not None for list_value in list_values)
                     else None
                 )
-            return cls(**collated)
+            return type(elem)(**collated)
 
         elif isinstance(elem, Pointclouds):
             return join_pointclouds_as_batch(batch)
@@ -434,6 +437,8 @@ class FrameData(Mapping[str, Any]):
         elif isinstance(elem, CamerasBase):
             # TODO: don't store K; enforce working in NDC space
             return join_cameras_as_batch(batch)
+        elif isinstance(elem, Meshes):
+            return join_meshes_as_batch(batch)
         else:
             return torch.utils.data.dataloader.default_collate(batch)
 
@@ -454,8 +459,8 @@ class FrameDataBuilderBase(ReplaceableBase, Generic[FrameDataSubtype], ABC):
     @abstractmethod
     def build(
         self,
-        frame_annotation: types.FrameAnnotation,
-        sequence_annotation: types.SequenceAnnotation,
+        frame_annotation: FrameAnnotationT,
+        sequence_annotation: SequenceAnnotationT,
         *,
         load_blobs: bool = True,
         **kwargs,
@@ -541,8 +546,8 @@ class GenericFrameDataBuilder(FrameDataBuilderBase[FrameDataSubtype], ABC):
 
     def build(
         self,
-        frame_annotation: types.FrameAnnotation,
-        sequence_annotation: types.SequenceAnnotation,
+        frame_annotation: FrameAnnotationT,
+        sequence_annotation: SequenceAnnotationT,
         *,
         load_blobs: bool = True,
         **kwargs,
@@ -586,58 +591,81 @@ class GenericFrameDataBuilder(FrameDataBuilderBase[FrameDataSubtype], ABC):
             ),
         )
 
-        fg_mask_np: Optional[np.ndarray] = None
+        dataset_root = self.dataset_root
         mask_annotation = frame_annotation.mask
-        if mask_annotation is not None:
-            if load_blobs and self.load_masks:
-                fg_mask_np, mask_path = self._load_fg_probability(frame_annotation)
+        depth_annotation = frame_annotation.depth
+        image_path: str | None = None
+        mask_path: str | None = None
+        depth_path: str | None = None
+        pcl_path: str | None = None
+        if dataset_root is not None:  # set all paths even if we won’t load blobs
+            if frame_annotation.image.path is not None:
+                image_path = os.path.join(dataset_root, frame_annotation.image.path)
+                frame_data.image_path = image_path
+
+            if mask_annotation is not None and mask_annotation.path:
+                mask_path = os.path.join(dataset_root, mask_annotation.path)
                 frame_data.mask_path = mask_path
+
+            if depth_annotation is not None and depth_annotation.path is not None:
+                depth_path = os.path.join(dataset_root, depth_annotation.path)
+                frame_data.depth_path = depth_path
+
+            if point_cloud is not None:
+                pcl_path = os.path.join(dataset_root, point_cloud.path)
+                frame_data.sequence_point_cloud_path = pcl_path
+
+        fg_mask_np: np.ndarray | None = None
+        bbox_xywh: tuple[float, float, float, float] | None = None
+
+        if mask_annotation is not None:
+            if load_blobs and self.load_masks and mask_path:
+                fg_mask_np = self._load_fg_probability(frame_annotation, mask_path)
                 frame_data.fg_probability = safe_as_tensor(fg_mask_np, torch.float)
 
             bbox_xywh = mask_annotation.bounding_box_xywh
-            if bbox_xywh is None and fg_mask_np is not None:
-                bbox_xywh = get_bbox_from_mask(fg_mask_np, self.box_crop_mask_thr)
-
-            frame_data.bbox_xywh = safe_as_tensor(bbox_xywh, torch.float)
 
         if frame_annotation.image is not None:
             image_size_hw = safe_as_tensor(frame_annotation.image.size, torch.long)
             frame_data.image_size_hw = image_size_hw  # original image size
             # image size after crop/resize
             frame_data.effective_image_size_hw = image_size_hw
-            image_path = None
-            dataset_root = self.dataset_root
-            if frame_annotation.image.path is not None and dataset_root is not None:
-                image_path = os.path.join(dataset_root, frame_annotation.image.path)
-                frame_data.image_path = image_path
 
             if load_blobs and self.load_images:
                 if image_path is None:
                     raise ValueError("Image path is required to load images.")
 
-                image_np = load_image(self._local_path(image_path))
+                no_mask = fg_mask_np is None  # didn’t read the mask file
+                image_np = load_image(
+                    self._local_path(image_path), try_read_alpha=no_mask
+                )
+                if image_np.shape[0] == 4:  # RGBA image
+                    if no_mask:
+                        fg_mask_np = image_np[3:]
+                        frame_data.fg_probability = safe_as_tensor(
+                            fg_mask_np, torch.float
+                        )
+
+                    image_np = image_np[:3]
+
                 frame_data.image_rgb = self._postprocess_image(
                     image_np, frame_annotation.image.size, frame_data.fg_probability
                 )
 
-        if (
-            load_blobs
-            and self.load_depths
-            and frame_annotation.depth is not None
-            and frame_annotation.depth.path is not None
-        ):
-            (
-                frame_data.depth_map,
-                frame_data.depth_path,
-                frame_data.depth_mask,
-            ) = self._load_mask_depth(frame_annotation, fg_mask_np)
+        if bbox_xywh is None and fg_mask_np is not None:
+            bbox_xywh = get_bbox_from_mask(fg_mask_np, self.box_crop_mask_thr)
+        frame_data.bbox_xywh = safe_as_tensor(bbox_xywh, torch.float)
+
+        if load_blobs and self.load_depths and depth_path is not None:
+            frame_data.depth_map, frame_data.depth_mask = self._load_mask_depth(
+                frame_annotation, depth_path, fg_mask_np
+            )
 
         if load_blobs and self.load_point_clouds and point_cloud is not None:
-            pcl_path = self._fix_point_cloud_path(point_cloud.path)
+            assert pcl_path is not None
             frame_data.sequence_point_cloud = load_pointcloud(
                 self._local_path(pcl_path), max_points=self.max_points
             )
-            frame_data.sequence_point_cloud_path = pcl_path
 
         if frame_annotation.viewpoint is not None:
             frame_data.camera = self._get_pytorch3d_camera(frame_annotation)
@@ -653,18 +681,14 @@ class GenericFrameDataBuilder(FrameDataBuilderBase[FrameDataSubtype], ABC):
 
         return frame_data
 
-    def _load_fg_probability(
-        self, entry: types.FrameAnnotation
-    ) -> Tuple[np.ndarray, str]:
-        assert self.dataset_root is not None and entry.mask is not None
-        full_path = os.path.join(self.dataset_root, entry.mask.path)
-        fg_probability = load_mask(self._local_path(full_path))
+    def _load_fg_probability(self, entry: FrameAnnotationT, path: str) -> np.ndarray:
+        fg_probability = load_mask(self._local_path(path))
         if fg_probability.shape[-2:] != entry.image.size:
             raise ValueError(
                 f"bad mask size: {fg_probability.shape[-2:]} vs {entry.image.size}!"
             )
 
-        return fg_probability, full_path
+        return fg_probability
 
     def _postprocess_image(
         self,
@@ -685,14 +709,14 @@ class GenericFrameDataBuilder(FrameDataBuilderBase[FrameDataSubtype], ABC):
 
     def _load_mask_depth(
         self,
-        entry: types.FrameAnnotation,
+        entry: FrameAnnotationT,
+        path: str,
         fg_mask: Optional[np.ndarray],
-    ) -> Tuple[torch.Tensor, str, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         entry_depth = entry.depth
         dataset_root = self.dataset_root
         assert dataset_root is not None
-        assert entry_depth is not None and entry_depth.path is not None
-        path = os.path.join(dataset_root, entry_depth.path)
+        assert entry_depth is not None
         depth_map = load_depth(self._local_path(path), entry_depth.scale_adjustment)
 
         if self.mask_depths:
@@ -706,11 +730,11 @@ class GenericFrameDataBuilder(FrameDataBuilderBase[FrameDataSubtype], ABC):
         else:
             depth_mask = (depth_map > 0.0).astype(np.float32)
 
-        return torch.tensor(depth_map), path, torch.tensor(depth_mask)
+        return torch.tensor(depth_map), torch.tensor(depth_mask)
 
     def _get_pytorch3d_camera(
         self,
-        entry: types.FrameAnnotation,
+        entry: FrameAnnotationT,
     ) -> PerspectiveCameras:
         entry_viewpoint = entry.viewpoint
         assert entry_viewpoint is not None
@@ -738,19 +762,6 @@ class GenericFrameDataBuilder(FrameDataBuilderBase[FrameDataSubtype], ABC):
             R=torch.tensor(entry_viewpoint.R, dtype=torch.float)[None],
             T=torch.tensor(entry_viewpoint.T, dtype=torch.float)[None],
         )
-
-    def _fix_point_cloud_path(self, path: str) -> str:
-        """
-        Fix up a point cloud path from the dataset.
-        Some files in Co3Dv2 have an accidental absolute path stored.
-        """
-        unwanted_prefix = (
-            "/large_experiments/p3/replay/datasets/co3d/co3d45k_220512/export_v23/"
-        )
-        if path.startswith(unwanted_prefix):
-            path = path[len(unwanted_prefix) :]
-        assert self.dataset_root is not None
-        return os.path.join(self.dataset_root, path)
 
     def _local_path(self, path: str) -> str:
         if self.path_manager is None:

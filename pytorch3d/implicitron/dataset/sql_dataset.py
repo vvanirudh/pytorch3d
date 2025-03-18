@@ -4,11 +4,15 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-unsafe
+
 import hashlib
 import json
 import logging
 import os
-from dataclasses import dataclass
+
+import urllib
+from dataclasses import dataclass, Field, field
 from typing import (
     Any,
     ClassVar,
@@ -29,17 +33,18 @@ import sqlalchemy as sa
 import torch
 from pytorch3d.implicitron.dataset.dataset_base import DatasetBase
 
-from pytorch3d.implicitron.dataset.frame_data import (  # noqa
+from pytorch3d.implicitron.dataset.frame_data import (
     FrameData,
-    FrameDataBuilder,
+    FrameDataBuilder,  # noqa
     FrameDataBuilderBase,
 )
+
 from pytorch3d.implicitron.tools.config import (
     registry,
     ReplaceableBase,
     run_auto_creation,
 )
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import scoped_session, Session, sessionmaker
 
 from .orm_types import SqlFrameAnnotation, SqlSequenceAnnotation
 
@@ -51,7 +56,7 @@ _SET_LISTS_TABLE: str = "set_lists"
 
 
 @registry.register
-class SqlIndexDataset(DatasetBase, ReplaceableBase):  # pyre-ignore
+class SqlIndexDataset(DatasetBase, ReplaceableBase):
     """
     A dataset with annotations stored as SQLite tables. This is an index-based dataset.
     The length is returned after all sequence and frame filters are applied (see param
@@ -88,6 +93,7 @@ class SqlIndexDataset(DatasetBase, ReplaceableBase):  # pyre-ignore
             engine verbatim. Don’t expose it to end users of your application!
         pick_categories: Restrict the dataset to the given list of categories.
         pick_sequences: A Sequence of sequence names to restrict the dataset to.
+        pick_sequences_sql_clause: Custom SQL WHERE clause to constrain sequence annotations.
         exclude_sequences: A Sequence of the names of the sequences to exclude.
         limit_sequences_per_category_to: Limit the dataset to the first up to N
             sequences within each category (applies after all other sequence filters
@@ -102,9 +108,16 @@ class SqlIndexDataset(DatasetBase, ReplaceableBase):  # pyre-ignore
             more frames than that; applied after other frame-level filters.
         seed: The seed of the random generator sampling `n_frames_per_sequence`
             random frames per sequence.
+        preload_metadata: If True, the metadata is preloaded into memory.
+        precompute_seq_to_idx: If True, precomputes the mapping from sequence name to indices.
+        scoped_session: If True, allows different parts of the code to share
+            a global session to access the database.
     """
 
     frame_annotations_type: ClassVar[Type[SqlFrameAnnotation]] = SqlFrameAnnotation
+    sequence_annotations_type: ClassVar[Type[SqlSequenceAnnotation]] = (
+        SqlSequenceAnnotation
+    )
 
     sqlite_metadata_file: str = ""
     dataset_root: Optional[str] = None
@@ -117,6 +130,7 @@ class SqlIndexDataset(DatasetBase, ReplaceableBase):  # pyre-ignore
     pick_categories: Tuple[str, ...] = ()
 
     pick_sequences: Tuple[str, ...] = ()
+    pick_sequences_sql_clause: Optional[str] = None
     exclude_sequences: Tuple[str, ...] = ()
     limit_sequences_per_category_to: int = 0
     limit_sequences_to: int = 0
@@ -124,11 +138,21 @@ class SqlIndexDataset(DatasetBase, ReplaceableBase):  # pyre-ignore
     n_frames_per_sequence: int = -1
     seed: int = 0
     remove_empty_masks_poll_whole_table_threshold: int = 300_000
+    preload_metadata: bool = False
+    precompute_seq_to_idx: bool = False
     # we set it manually in the constructor
-    # _index: pd.DataFrame = field(init=False)
+    _index: pd.DataFrame = field(init=False, metadata={"omegaconf_ignore": True})
+    _sql_engine: sa.engine.Engine = field(
+        init=False, metadata={"omegaconf_ignore": True}
+    )
+    eval_batches: Optional[List[Any]] = field(
+        init=False, metadata={"omegaconf_ignore": True}
+    )
 
-    frame_data_builder: FrameDataBuilderBase
+    frame_data_builder: FrameDataBuilderBase  # pyre-ignore[13]
     frame_data_builder_class_type: str = "FrameDataBuilder"
+
+    scoped_session: bool = False
 
     def __post_init__(self) -> None:
         if sa.__version__ < "2.0":
@@ -138,18 +162,27 @@ class SqlIndexDataset(DatasetBase, ReplaceableBase):  # pyre-ignore
             raise ValueError("sqlite_metadata_file must be set")
 
         if self.dataset_root:
-            frame_builder_type = self.frame_data_builder_class_type
-            getattr(self, f"frame_data_builder_{frame_builder_type}_args")[
-                "dataset_root"
-            ] = self.dataset_root
+            frame_args = f"frame_data_builder_{self.frame_data_builder_class_type}_args"
+            getattr(self, frame_args)["dataset_root"] = self.dataset_root
+            getattr(self, frame_args)["path_manager"] = self.path_manager
 
         run_auto_creation(self)
-        self.frame_data_builder.path_manager = self.path_manager
 
-        # pyre-ignore  # NOTE: sqlite-specific args (read-only mode).
+        if self.path_manager is not None:
+            self.sqlite_metadata_file = self.path_manager.get_local_path(
+                self.sqlite_metadata_file
+            )
+            self.subset_lists_file = self.path_manager.get_local_path(
+                self.subset_lists_file
+            )
+
+        # NOTE: sqlite-specific args (read-only mode).
         self._sql_engine = sa.create_engine(
-            f"sqlite:///file:{self.sqlite_metadata_file}?mode=ro&uri=true"
+            f"sqlite:///file:{urllib.parse.quote(self.sqlite_metadata_file)}?mode=ro&uri=true"
         )
+
+        if self.preload_metadata:
+            self._sql_engine = self._preload_database(self._sql_engine)
 
         sequences = self._get_filtered_sequences_if_any()
 
@@ -166,16 +199,29 @@ class SqlIndexDataset(DatasetBase, ReplaceableBase):  # pyre-ignore
         if len(index) == 0:
             raise ValueError(f"There are no frames in the subsets: {self.subsets}!")
 
-        self._index = index.set_index(["sequence_name", "frame_number"])  # pyre-ignore
+        self._index = index.set_index(["sequence_name", "frame_number"])
 
-        self.eval_batches = None  # pyre-ignore
+        self.eval_batches = None
         if self.eval_batches_file:
             self.eval_batches = self._load_filter_eval_batches()
 
         logger.info(str(self))
 
+        if self.scoped_session:
+            self._session_factory = sessionmaker(bind=self._sql_engine)  # pyre-ignore
+
+        if self.precompute_seq_to_idx:
+            # This is deprecated and will be removed in the future.
+            # After we backport https://github.com/facebookresearch/uco3d/pull/3
+            logger.warning(
+                "Using precompute_seq_to_idx is deprecated and will be removed in the future."
+            )
+            self._index["rowid"] = np.arange(len(self._index))
+            groupby = self._index.groupby("sequence_name", sort=False)["rowid"]
+            self._seq_to_indices = dict(groupby.apply(list))  # pyre-ignore
+            del self._index["rowid"]
+
     def __len__(self) -> int:
-        # pyre-ignore[16]
         return len(self._index)
 
     def __getitem__(self, frame_idx: Union[int, Tuple[str, int]]) -> FrameData:
@@ -232,12 +278,18 @@ class SqlIndexDataset(DatasetBase, ReplaceableBase):  # pyre-ignore
             self.frame_annotations_type.frame_number
             == int(frame),  # cast from np.int64
         )
-        seq_stmt = sa.select(SqlSequenceAnnotation).where(
-            SqlSequenceAnnotation.sequence_name == seq
+        seq_stmt = sa.select(self.sequence_annotations_type).where(
+            self.sequence_annotations_type.sequence_name == seq
         )
-        with Session(self._sql_engine) as session:
-            entry = session.scalars(stmt).one()
-            seq_metadata = session.scalars(seq_stmt).one()
+        if self.scoped_session:
+            # pyre-ignore
+            with scoped_session(self._session_factory)() as session:
+                entry = session.scalars(stmt).one()
+                seq_metadata = session.scalars(seq_stmt).one()
+        else:
+            with Session(self._sql_engine) as session:
+                entry = session.scalars(stmt).one()
+                seq_metadata = session.scalars(seq_stmt).one()
 
         assert entry.image.path == self._index.loc[(seq, frame), "_image_path"]
 
@@ -250,7 +302,6 @@ class SqlIndexDataset(DatasetBase, ReplaceableBase):  # pyre-ignore
         return frame_data
 
     def __str__(self) -> str:
-        # pyre-ignore[16]
         return f"SqlIndexDataset #frames={len(self._index)}"
 
     def sequence_names(self) -> Iterable[str]:
@@ -260,9 +311,10 @@ class SqlIndexDataset(DatasetBase, ReplaceableBase):  # pyre-ignore
     # override
     def category_to_sequence_names(self) -> Dict[str, List[str]]:
         stmt = sa.select(
-            SqlSequenceAnnotation.category, SqlSequenceAnnotation.sequence_name
+            self.sequence_annotations_type.category,
+            self.sequence_annotations_type.sequence_name,
         ).where(  # we limit results to sequences that have frames after all filters
-            SqlSequenceAnnotation.sequence_name.in_(self.sequence_names())
+            self.sequence_annotations_type.sequence_name.in_(self.sequence_names())
         )
         with self._sql_engine.connect() as connection:
             cat_to_seqs = pd.read_sql(stmt, connection)
@@ -335,16 +387,30 @@ class SqlIndexDataset(DatasetBase, ReplaceableBase):  # pyre-ignore
         rows = self._index.index.get_loc(seq_name)
         if isinstance(rows, slice):
             assert rows.stop is not None, "Unexpected result from pandas"
-            rows = range(rows.start or 0, rows.stop, rows.step or 1)
+            rows_seq = range(rows.start or 0, rows.stop, rows.step or 1)
         else:
-            rows = np.where(rows)[0]
+            rows_seq = list(np.where(rows)[0])
 
         index_slice, idx = self._get_frame_no_coalesced_ts_by_row_indices(
-            rows, seq_name, subset_filter
+            rows_seq, seq_name, subset_filter
         )
         index_slice["idx"] = idx
 
         yield from index_slice.itertuples(index=False)
+
+    # override
+    def sequence_indices_in_order(
+        self, seq_name: str, subset_filter: Optional[Sequence[str]] = None
+    ) -> Iterator[int]:
+        """Same as `sequence_frames_in_order` but returns the iterator over
+        only dataset indices.
+        """
+        if self.precompute_seq_to_idx and subset_filter is None:
+            # pyre-ignore
+            yield from self._seq_to_indices[seq_name]
+        else:
+            for _, _, idx in self.sequence_frames_in_order(seq_name, subset_filter):
+                yield idx
 
     # override
     def get_eval_batches(self) -> Optional[List[Any]]:
@@ -379,10 +445,34 @@ class SqlIndexDataset(DatasetBase, ReplaceableBase):  # pyre-ignore
             or self.limit_sequences_to > 0
             or self.limit_sequences_per_category_to > 0
             or len(self.pick_sequences) > 0
+            or self.pick_sequences_sql_clause is not None
             or len(self.exclude_sequences) > 0
             or len(self.pick_categories) > 0
             or self.n_frames_per_sequence > 0
         )
+
+    def _preload_database(
+        self, source_engine: sa.engine.base.Engine
+    ) -> sa.engine.base.Engine:
+        destination_engine = sa.create_engine("sqlite:///:memory:")
+        metadata = sa.MetaData()
+        metadata.reflect(bind=source_engine)
+        metadata.create_all(bind=destination_engine)
+
+        with source_engine.connect() as source_conn:
+            with destination_engine.connect() as destination_conn:
+                for table_obj in metadata.tables.values():
+                    # Select all rows from the source table
+                    source_rows = source_conn.execute(table_obj.select())
+
+                    # Insert rows into the destination table
+                    for row in source_rows:
+                        destination_conn.execute(table_obj.insert().values(row))
+
+                    # Commit the changes for each table
+                    destination_conn.commit()
+
+        return destination_engine
 
     def _get_filtered_sequences_if_any(self) -> Optional[pd.Series]:
         # maximum possible filter (if limit_sequences_per_category_to == 0):
@@ -396,19 +486,22 @@ class SqlIndexDataset(DatasetBase, ReplaceableBase):  # pyre-ignore
             *self._get_pick_filters(),
             *self._get_exclude_filters(),
         ]
+        if self.pick_sequences_sql_clause:
+            print("Applying the custom SQL clause.")
+            where_conditions.append(sa.text(self.pick_sequences_sql_clause))
 
         def add_where(stmt):
             return stmt.where(*where_conditions) if where_conditions else stmt
 
         if self.limit_sequences_per_category_to <= 0:
-            stmt = add_where(sa.select(SqlSequenceAnnotation.sequence_name))
+            stmt = add_where(sa.select(self.sequence_annotations_type.sequence_name))
         else:
             subquery = sa.select(
-                SqlSequenceAnnotation.sequence_name,
+                self.sequence_annotations_type.sequence_name,
                 sa.func.row_number()
                 .over(
                     order_by=sa.text("ROWID"),  # NOTE: ROWID is SQLite-specific
-                    partition_by=SqlSequenceAnnotation.category,
+                    partition_by=self.sequence_annotations_type.category,
                 )
                 .label("row_number"),
             )
@@ -444,31 +537,34 @@ class SqlIndexDataset(DatasetBase, ReplaceableBase):  # pyre-ignore
             return []
 
         logger.info(f"Limiting dataset to categories: {self.pick_categories}")
-        return [SqlSequenceAnnotation.category.in_(self.pick_categories)]
+        return [self.sequence_annotations_type.category.in_(self.pick_categories)]
 
     def _get_pick_filters(self) -> List[sa.ColumnElement]:
         if not self.pick_sequences:
             return []
 
         logger.info(f"Limiting dataset to sequences: {self.pick_sequences}")
-        return [SqlSequenceAnnotation.sequence_name.in_(self.pick_sequences)]
+        return [self.sequence_annotations_type.sequence_name.in_(self.pick_sequences)]
 
     def _get_exclude_filters(self) -> List[sa.ColumnOperators]:
         if not self.exclude_sequences:
             return []
 
         logger.info(f"Removing sequences from the dataset: {self.exclude_sequences}")
-        return [SqlSequenceAnnotation.sequence_name.notin_(self.exclude_sequences)]
+        return [
+            self.sequence_annotations_type.sequence_name.notin_(self.exclude_sequences)
+        ]
 
     def _load_subsets_from_json(self, subset_lists_path: str) -> pd.DataFrame:
-        assert self.subsets is not None
+        subsets = self.subsets
+        assert subsets is not None
         with open(subset_lists_path, "r") as f:
             subset_to_seq_frame = json.load(f)
 
         seq_frame_list = sum(
             (
                 [(*row, subset) for row in subset_to_seq_frame[subset]]
-                for subset in self.subsets
+                for subset in subsets
             ),
             [],
         )
@@ -522,7 +618,7 @@ class SqlIndexDataset(DatasetBase, ReplaceableBase):  # pyre-ignore
                 stmt = sa.select(
                     self.frame_annotations_type.sequence_name,
                     self.frame_annotations_type.frame_number,
-                ).where(self.frame_annotations_type._mask_mass == 0)
+                ).where(self.frame_annotations_type._mask_mass == 0)  # pyre-ignore[16]
                 with Session(self._sql_engine) as session:
                     to_remove = session.execute(stmt).all()
 
@@ -586,7 +682,7 @@ class SqlIndexDataset(DatasetBase, ReplaceableBase):  # pyre-ignore
         stmt = sa.select(
             self.frame_annotations_type.sequence_name,
             self.frame_annotations_type.frame_number,
-            self.frame_annotations_type._image_path,
+            self.frame_annotations_type._image_path,  # pyre-ignore[16]
             sa.null().label("subset"),
         )
         where_conditions = []
@@ -600,7 +696,7 @@ class SqlIndexDataset(DatasetBase, ReplaceableBase):  # pyre-ignore
             logger.info("  excluding samples with empty masks")
             where_conditions.append(
                 sa.or_(
-                    self.frame_annotations_type._mask_mass.is_(None),
+                    self.frame_annotations_type._mask_mass.is_(None),  # pyre-ignore[16]
                     self.frame_annotations_type._mask_mass != 0,
                 )
             )
@@ -634,7 +730,9 @@ class SqlIndexDataset(DatasetBase, ReplaceableBase):  # pyre-ignore
         assert self.eval_batches_file
         logger.info(f"Loading eval batches from {self.eval_batches_file}")
 
-        if not os.path.isfile(self.eval_batches_file):
+        if (
+            self.path_manager and not self.path_manager.isfile(self.eval_batches_file)
+        ) or (not self.path_manager and not os.path.isfile(self.eval_batches_file)):
             # The batch indices file does not exist.
             # Most probably the user has not specified the root folder.
             raise ValueError(
@@ -642,7 +740,8 @@ class SqlIndexDataset(DatasetBase, ReplaceableBase):  # pyre-ignore
                 + "Please specify a correct dataset_root folder."
             )
 
-        with open(self.eval_batches_file, "r") as f:
+        eval_batches_file = self._local_path(self.eval_batches_file)
+        with open(eval_batches_file, "r") as f:
             eval_batches = json.load(f)
 
         # limit the dataset to sequences to allow multiple evaluations in one file
@@ -726,9 +825,15 @@ class SqlIndexDataset(DatasetBase, ReplaceableBase):  # pyre-ignore
             self.frame_annotations_type.sequence_name == seq_name,
             self.frame_annotations_type.frame_number.in_(frames),
         )
+        frame_no_ts = None
 
-        with self._sql_engine.connect() as connection:
-            frame_no_ts = pd.read_sql_query(stmt, connection)
+        if self.scoped_session:
+            stmt_text = str(stmt.compile(compile_kwargs={"literal_binds": True}))
+            with scoped_session(self._session_factory)() as session:  # pyre-ignore
+                frame_no_ts = pd.read_sql_query(stmt_text, session.connection())
+        else:
+            with self._sql_engine.connect() as connection:
+                frame_no_ts = pd.read_sql_query(stmt, connection)
 
         if len(frame_no_ts) != len(index_slice):
             raise ValueError(
@@ -758,11 +863,18 @@ class SqlIndexDataset(DatasetBase, ReplaceableBase):  # pyre-ignore
             prefixes=["TEMP"],  # NOTE SQLite specific!
         )
 
+    @classmethod
+    def pre_expand(cls) -> None:
+        # remove dataclass annotations that are not meant to be init params
+        # because they cause troubles for OmegaConf
+        for attr, attr_value in list(cls.__dict__.items()):  # need to copy as we mutate
+            if isinstance(attr_value, Field) and attr_value.metadata.get(
+                "omegaconf_ignore", False
+            ):
+                delattr(cls, attr)
+                del cls.__annotations__[attr]
+
 
 def _seq_name_to_seed(seq_name) -> int:
     """Generates numbers in [0, 2 ** 28)"""
     return int(hashlib.sha1(seq_name.encode("utf-8")).hexdigest()[:7], 16)
-
-
-def _safe_as_tensor(data, dtype):
-    return torch.tensor(data, dtype=dtype) if data is not None else None

@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-unsafe
+
 
 import logging
 import os
@@ -43,7 +45,7 @@ logger = logging.getLogger(__name__)
 
 
 @registry.register
-class SqlIndexDatasetMapProvider(DatasetMapProviderBase):  # pyre-ignore [13]
+class SqlIndexDatasetMapProvider(DatasetMapProviderBase):
     """
     Generates the training, validation, and testing dataset objects for
     a dataset laid out on disk like SQL-CO3D, with annotations in an SQLite data base.
@@ -193,9 +195,9 @@ class SqlIndexDatasetMapProvider(DatasetMapProviderBase):  # pyre-ignore [13]
 
     # this is a mould that is never constructed, used to build self._dataset_map values
     dataset_class_type: str = "SqlIndexDataset"
-    dataset: SqlIndexDataset
+    dataset: SqlIndexDataset  # pyre-ignore [13]
 
-    path_manager_factory: PathManagerFactory
+    path_manager_factory: PathManagerFactory  # pyre-ignore [13]
     path_manager_factory_class_type: str = "PathManagerFactory"
 
     def __post_init__(self):
@@ -282,8 +284,14 @@ class SqlIndexDatasetMapProvider(DatasetMapProviderBase):  # pyre-ignore [13]
                 logger.info(f"Val dataset: {str(val_dataset)}")
 
             logger.debug("Extracting test dataset.")
-            eval_batches_file = self._get_lists_file("eval_batches")
-            del common_dataset_kwargs["eval_batches_file"]
+            if self.eval_batches_path is None:
+                eval_batches_file = None
+            else:
+                eval_batches_file = self._get_lists_file("eval_batches")
+
+            if "eval_batches_file" in common_dataset_kwargs:
+                common_dataset_kwargs.pop("eval_batches_file", None)
+
             test_dataset = dataset_type(
                 **common_dataset_kwargs,
                 subsets=self._get_subsets(self.test_subsets, True),
