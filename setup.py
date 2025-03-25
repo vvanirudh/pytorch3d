@@ -129,15 +129,23 @@ def get_extensions():
 # Retrieve __version__ from the package.
 __version__ = runpy.run_path("pytorch3d/__init__.py")["__version__"]
 
+import multiprocessing
 
+NUM_WORKERS = os.getenv("PYTORCH3D_BUILD_WORKERS", str(multiprocessing.cpu_count()))
 if os.getenv("PYTORCH3D_NO_NINJA", "0") == "1":
 
     class BuildExtension(torch.utils.cpp_extension.BuildExtension):
         def __init__(self, *args, **kwargs):
-            super().__init__(use_ninja=False, *args, **kwargs)
+            super().__init__(use_ninja=False, parallel=NUM_WORKERS, *args, **kwargs)
 
 else:
-    BuildExtension = torch.utils.cpp_extension.BuildExtension
+
+    class BuildExtension(torch.utils.cpp_extension.BuildExtension):
+        def __init__(self, *args, **kwargs):
+            # With Ninja, set environment variable for parallel compilation
+            os.environ["MAX_JOBS"] = NUM_WORKERS
+            super().__init__(*args, **kwargs)
+
 
 trainer = "pytorch3d.implicitron_trainer"
 
